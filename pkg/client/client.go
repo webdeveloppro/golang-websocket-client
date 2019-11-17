@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -10,10 +11,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Send pings to peer with this period
+const pingPeriod = 30 * time.Second
+
 // WebSocketClient return websocket client connection
 type WebSocketClient struct {
 	configStr string
 	sendBuf   chan []byte
+	ctx       context.Context
+	ctxCancel context.CancelFunc
 
 	mu     sync.RWMutex
 	wsconn *websocket.Conn
@@ -22,15 +28,16 @@ type WebSocketClient struct {
 // NewWebSocketClient create new websocket connection
 func NewWebSocketClient(host, channel string) (*WebSocketClient, error) {
 	conn := WebSocketClient{
-		sendBuf: make(chan []byte, 100),
+		sendBuf: make(chan []byte, 1),
 	}
+	conn.ctx, conn.ctxCancel = context.WithCancel(context.Background())
 
 	u := url.URL{Scheme: "ws", Host: host, Path: channel}
 	conn.configStr = u.String()
 
-	go conn.Connect()
 	go conn.listen()
 	go conn.listenWrite()
+	go conn.ping()
 	return &conn, nil
 }
 
@@ -44,14 +51,19 @@ func (conn *WebSocketClient) Connect() *websocket.Conn {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for ; ; <-ticker.C {
-		ws, _, err := websocket.DefaultDialer.Dial(conn.configStr, nil)
-		if err != nil {
-			conn.log("connect", err, fmt.Sprintf("Cannot connect to websocket: %s", conn.configStr))
-			continue
+		select {
+		case <-conn.ctx.Done():
+			return nil
+		default:
+			ws, _, err := websocket.DefaultDialer.Dial(conn.configStr, nil)
+			if err != nil {
+				conn.log("connect", err, fmt.Sprintf("Cannot connect to websocket: %s", conn.configStr))
+				continue
+			}
+			conn.log("connect", nil, fmt.Sprintf("connected to websocket to %s", conn.configStr))
+			conn.wsconn = ws
+			return conn.wsconn
 		}
-		conn.log("connect", nil, fmt.Sprintf("connected to websocket to %s", conn.configStr))
-		conn.wsconn = ws
-		return conn.wsconn
 	}
 }
 
@@ -60,17 +72,24 @@ func (conn *WebSocketClient) listen() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		ws := conn.Connect()
-		if ws == nil {
+		select {
+		case <-conn.ctx.Done():
 			return
+		case <-ticker.C:
+			for {
+				ws := conn.Connect()
+				if ws == nil {
+					return
+				}
+				_, bytMsg, err := ws.ReadMessage()
+				if err != nil {
+					conn.log("listen", err, "Cannot read websocket message")
+					conn.closeWs()
+					break
+				}
+				conn.log("listen", nil, fmt.Sprintf("websocket msg: %x\n", bytMsg))
+			}
 		}
-		_, bytMsg, err := ws.ReadMessage()
-		if err != nil {
-			conn.log("listen", err, "Cannot read websocket message")
-			conn.Stop()
-			break
-		}
-		conn.log("listen", nil, fmt.Sprintf("receive msg %s\n", bytMsg))
 	}
 }
 
@@ -80,8 +99,17 @@ func (conn *WebSocketClient) Write(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	conn.sendBuf <- data
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
+	defer cancel()
+
+	for {
+		select {
+		case conn.sendBuf <- data:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("context canceled")
+		}
+	}
 }
 
 func (conn *WebSocketClient) listenWrite() {
@@ -105,6 +133,12 @@ func (conn *WebSocketClient) listenWrite() {
 
 // Close will send close message and shutdown websocket connection
 func (conn *WebSocketClient) Stop() {
+	conn.ctxCancel()
+	conn.closeWs()
+}
+
+// Close will send close message and shutdown websocket connection
+func (conn *WebSocketClient) closeWs() {
 	conn.mu.Lock()
 	if conn.wsconn != nil {
 		conn.wsconn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
@@ -112,6 +146,26 @@ func (conn *WebSocketClient) Stop() {
 		conn.wsconn = nil
 	}
 	conn.mu.Unlock()
+}
+
+func (conn *WebSocketClient) ping() {
+	conn.log("ping", nil, "ping pong started")
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ws := conn.Connect()
+			if ws == nil {
+				continue
+			}
+			if err := conn.wsconn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(pingPeriod/2)); err != nil {
+				conn.closeWs()
+			}
+		case <-conn.ctx.Done():
+			return
+		}
+	}
 }
 
 // Log print log statement
