@@ -14,7 +14,7 @@ import (
 type WebSocketClient struct {
 	configStr string
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	wsconn *websocket.Conn
 }
 
@@ -31,11 +31,12 @@ func NewWebSocketClient(host, channel string) (*WebSocketClient, error) {
 }
 
 func (conn *WebSocketClient) Connect() *websocket.Conn {
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
+	conn.mu.RLock()
 	if conn.wsconn != nil {
+		defer conn.mu.RUnlock()
 		return conn.wsconn
 	}
+	conn.mu.RUnlock()
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -46,7 +47,9 @@ func (conn *WebSocketClient) Connect() *websocket.Conn {
 			continue
 		}
 		conn.log("connect", nil, fmt.Sprintf("connected to websocket to %s", conn.configStr))
+		conn.mu.Lock()
 		conn.wsconn = ws
+		conn.mu.Unlock()
 		return conn.wsconn
 	}
 }
@@ -56,19 +59,17 @@ func (conn *WebSocketClient) listen() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		for {
-			ws := conn.Connect()
-			if ws == nil {
-				return
-			}
-			_, bytMsg, err := ws.ReadMessage()
-			if err != nil {
-				conn.log("listen", err, "Cannot read websocket message")
-				conn.Stop()
-				break
-			}
-			conn.log("listen", nil, fmt.Sprintf("receive msg %s\n", bytMsg))
+		ws := conn.Connect()
+		if ws == nil {
+			return
 		}
+		_, bytMsg, err := ws.ReadMessage()
+		if err != nil {
+			conn.log("listen", err, "Cannot read websocket message")
+			conn.Stop()
+			break
+		}
+		conn.log("listen", nil, fmt.Sprintf("receive msg %s\n", bytMsg))
 	}
 }
 
@@ -78,7 +79,9 @@ func (conn *WebSocketClient) Write(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	ws := conn.Connect()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	ws := conn.wsconn
 	if ws == nil {
 		err := fmt.Errorf("conn.ws is nil")
 		return err
@@ -96,11 +99,13 @@ func (conn *WebSocketClient) Write(payload interface{}) error {
 
 // Close will send close message and shutdown websocket connection
 func (conn *WebSocketClient) Stop() {
+	conn.mu.Lock()
 	if conn.wsconn != nil {
 		conn.wsconn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		conn.wsconn.Close()
 		conn.wsconn = nil
 	}
+	conn.mu.Unlock()
 }
 
 // Log print log statement
