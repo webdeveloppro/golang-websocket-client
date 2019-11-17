@@ -13,6 +13,7 @@ import (
 // WebSocketClient return websocket client connection
 type WebSocketClient struct {
 	configStr string
+	sendBuf   chan []byte
 
 	mu     sync.RWMutex
 	wsconn *websocket.Conn
@@ -20,23 +21,25 @@ type WebSocketClient struct {
 
 // NewWebSocketClient create new websocket connection
 func NewWebSocketClient(host, channel string) (*WebSocketClient, error) {
-	conn := WebSocketClient{}
+	conn := WebSocketClient{
+		sendBuf: make(chan []byte, 100),
+	}
 
 	u := url.URL{Scheme: "ws", Host: host, Path: channel}
 	conn.configStr = u.String()
 
 	go conn.Connect()
 	go conn.listen()
+	go conn.listenWrite()
 	return &conn, nil
 }
 
 func (conn *WebSocketClient) Connect() *websocket.Conn {
-	conn.mu.RLock()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	if conn.wsconn != nil {
-		defer conn.mu.RUnlock()
 		return conn.wsconn
 	}
-	conn.mu.RUnlock()
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -47,9 +50,7 @@ func (conn *WebSocketClient) Connect() *websocket.Conn {
 			continue
 		}
 		conn.log("connect", nil, fmt.Sprintf("connected to websocket to %s", conn.configStr))
-		conn.mu.Lock()
 		conn.wsconn = ws
-		conn.mu.Unlock()
 		return conn.wsconn
 	}
 }
@@ -73,28 +74,33 @@ func (conn *WebSocketClient) listen() {
 	}
 }
 
-// Write data to the websocket server or drop it after 50ms
+// Write data to the websocket server
 func (conn *WebSocketClient) Write(payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-	ws := conn.wsconn
-	if ws == nil {
-		err := fmt.Errorf("conn.ws is nil")
-		return err
-	}
-
-	if err := ws.WriteMessage(
-		websocket.TextMessage,
-		data,
-	); err != nil {
-		conn.log("Write", nil, "WebSocket Write Error")
-	}
-	conn.log("Write", nil, fmt.Sprintf("sent: %s", data))
+	conn.sendBuf <- data
 	return nil
+}
+
+func (conn *WebSocketClient) listenWrite() {
+	for data := range conn.sendBuf {
+		ws := conn.Connect()
+		if ws == nil {
+			err := fmt.Errorf("conn.ws is nil")
+			conn.log("listenWrite", err, "No websocket connection")
+			continue
+		}
+
+		if err := ws.WriteMessage(
+			websocket.TextMessage,
+			data,
+		); err != nil {
+			conn.log("listenWrite", nil, "WebSocket Write Error")
+		}
+		conn.log("listenWrite", nil, fmt.Sprintf("send: %s", data))
+	}
 }
 
 // Close will send close message and shutdown websocket connection
