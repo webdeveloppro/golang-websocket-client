@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,7 +13,9 @@ import (
 // WebSocketClient return websocket client connection
 type WebSocketClient struct {
 	configStr string
-	wsconn    *websocket.Conn
+
+	mu     sync.Mutex
+	wsconn *websocket.Conn
 }
 
 // NewWebSocketClient create new websocket connection
@@ -22,11 +25,14 @@ func NewWebSocketClient(host, channel string) (*WebSocketClient, error) {
 	u := url.URL{Scheme: "ws", Host: host, Path: channel}
 	conn.configStr = u.String()
 
+	go conn.Connect()
 	go conn.listen()
 	return &conn, nil
 }
 
 func (conn *WebSocketClient) Connect() *websocket.Conn {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	if conn.wsconn != nil {
 		return conn.wsconn
 	}
